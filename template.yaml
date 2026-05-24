@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Certificate Renewal Lambda Function for Azure Entra ID'
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: certificate-renewal-lambda
+    Description: Name of the Lambda function
+  
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, staging, prod)
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+Resources:
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FunctionName}-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${FunctionName}/*'
+
+  # Lambda Function
+  CertificateRenewalFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${FunctionName}-${Environment}'
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Sub '${FunctionName}/lambda-code.zip'
+      Environment:
+        Variables:
+          # Azure/Entra Configuration - Store secrets in AWS Secrets Manager
+          TENANT_ID: !Sub '{{resolve:secretsmanager:${FunctionName}/azure:SecretString:TENANT_ID}}'
+          ADMIN_CLIENT_ID: !Sub '{{resolve:secretsmanager:${FunctionName}/azure:SecretString:ADMIN_CLIENT_ID}}'
+          ADMIN_CLIENT_SECRET: !Sub '{{resolve:secretsmanager:${FunctionName}/azure:SecretString:ADMIN_CLIENT_SECRET}}'
+          TARGET_CLIENT_ID: !Sub '{{resolve:secretsmanager:${FunctionName}/azure:SecretString:TARGET_CLIENT_ID}}'
+          # AWS Configuration
+          AWS_SECRET_NAME: !Sub '${FunctionName}/tokens'
+          AWS_REGION: !Ref AWS::Region
+
+  # S3 Bucket for Lambda Code
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${FunctionName}-deployment-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # EventBridge Rule for scheduled execution (optional - runs daily at 2 AM UTC)
+  CertificateRenewalSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${FunctionName}-schedule-${Environment}'
+      Description: Schedule certificate renewal Lambda function
+      ScheduleExpression: 'cron(0 2 * * ? *)'  # Daily at 2 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CertificateRenewalFunction.Arn
+          Id: CertificateRenewalTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CertificateRenewalFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CertificateRenewalSchedule.Arn
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt CertificateRenewalFunction.Arn
+    Export:
+      Name: !Sub '${FunctionName}-arn'
+
+  FunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref CertificateRenewalFunction
+    Export:
+      Name: !Sub '${FunctionName}-name'
+
+  DeploymentBucketName:
+    Description: S3 bucket for Lambda code
+    Value: !Ref DeploymentBucket
+    Export:
+      Name: !Sub '${FunctionName}-bucket'
+
+  RoleArn:
+    Description: IAM Role ARN for Lambda execution
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${FunctionName}-role-arn'
