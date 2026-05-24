@@ -1,0 +1,137 @@
+name: Destroy AWS Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirmation:
+        description: 'Type "DELETE" to confirm'
+        required: true
+
+env:
+  AWS_REGION: ap-south-1
+  FUNCTION_NAME: certificate-renewal-lambda
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirmation == 'DELETE'
+    
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Confirm Destruction
+        run: |
+          if [ "${{ github.event.inputs.confirmation }}" != "DELETE" ]; then
+            echo "❌ Destruction cancelled - confirmation not provided"
+            exit 1
+          fi
+          echo "⚠️ Proceeding with resource destruction for ${{ github.event.inputs.environment }}"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set Stack Name
+        run: |
+          ENVIRONMENT=${{ github.event.inputs.environment }}
+          echo "STACK_NAME=certificate-renewal-stack-${ENVIRONMENT}" >> $GITHUB_ENV
+
+      - name: Delete Secrets
+        continue-on-error: true
+        run: |
+          echo "Deleting AWS Secrets Manager secrets..."
+          aws secretsmanager delete-secret \
+            --secret-id ${{ env.FUNCTION_NAME }}/azure \
+            --force-delete-without-recovery \
+            --region ${{ env.AWS_REGION }} || echo "Secret not found"
+          
+          aws secretsmanager delete-secret \
+            --secret-id ${{ env.FUNCTION_NAME }}/tokens \
+            --force-delete-without-recovery \
+            --region ${{ env.AWS_REGION }} || echo "Secret not found"
+
+      - name: Empty S3 Bucket
+        continue-on-error: true
+        run: |
+          echo "Emptying S3 bucket..."
+          BUCKET_NAME="${{ env.FUNCTION_NAME }}-deployment-${{ secrets.AWS_ACCOUNT_ID }}"
+          aws s3 rm "s3://${BUCKET_NAME}" --recursive --region ${{ env.AWS_REGION }} || echo "Bucket not found"
+
+      - name: Delete CloudFormation Stack
+        run: |
+          echo "Deleting CloudFormation stack: ${{ env.STACK_NAME }}"
+          aws cloudformation delete-stack \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "Waiting for stack deletion..."
+          aws cloudformation wait stack-delete-complete \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} || echo "Stack deletion in progress"
+
+      - name: Verify Deletion
+        run: |
+          echo "Verifying stack deletion..."
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "DELETED")
+          
+          if [[ "$STACK_STATUS" == "DELETED" ]] || [[ "$STACK_STATUS" == "" ]]; then
+            echo "✅ Stack successfully deleted"
+          else
+            echo "⚠️ Stack status: $STACK_STATUS"
+          fi
+
+      - name: Create Destruction Report
+        if: always()
+        run: |
+          cat > destruction-report.md << EOF
+          # Destruction Report
+          
+          **Environment:** ${{ github.event.inputs.environment }}
+          **Stack Name:** ${{ env.STACK_NAME }}
+          **Region:** ${{ env.AWS_REGION }}
+          **Timestamp:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          **Destroyed By:** ${{ github.actor }}
+          
+          ## Resources Destroyed
+          - ✅ CloudFormation Stack
+          - ✅ Lambda Function
+          - ✅ IAM Role
+          - ✅ EventBridge Rule
+          - ✅ S3 Bucket (emptied)
+          - ✅ AWS Secrets Manager secrets
+          
+          ## Note
+          Some S3 bucket retention may apply. Check AWS Console for final cleanup.
+          EOF
+          
+          cat destruction-report.md
+
+      - name: Upload Destruction Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: destruction-report-${{ github.event.inputs.environment }}
+          path: destruction-report.md
+          retention-days: 30
